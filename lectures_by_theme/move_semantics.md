@@ -19,6 +19,14 @@
   - [Идея решения](#идея-решения)
   - [Реализация `std::move` и `std::forward`](#реализация-stdmove-и-stdforward)
 - [Практический пример: `Allocator::construct()`](#практический-пример-allocatorconstruct)
+- [Проблемы forwarding references](#проблемы-forwarding-references)
+  - [Конструкторы](#конструкторы)
+- [Аргументы по умолчанию](#аргументы-по-умолчанию)
+- [Copy ellision](#copy-ellision)
+  - [RVO - Return Value Optimization (стандартизовано с C++17)](#rvo---return-value-optimization-стандартизовано-с-c17)
+  - [NRVO - Named Return Value Optimization](#nrvo---named-return-value-optimization)
+- [Проблема в `std::vector`](#проблема-в-stdvector)
+- [Reference qualifier](#reference-qualifier)
 
 ## Основная идея move semantics
 
@@ -396,4 +404,225 @@ struct Allocator {
     new(ptr) T(std::forward<Args>(args)...);
   }
 };
+```
+
+## Проблемы forwarding references
+
+### Конструкторы
+
+```cpp
+struct S {
+  S() = default;
+
+  // Сюда подходит любой конструктор от одного аргумента
+  // Всё настолько плохо, что ещё и тип будет идеально подходить
+  template <typename T>
+  S(T&& value) {
+    std::cout << "template\n";
+  }
+};
+
+int main() {
+  S s;
+  const S cs;
+
+  S s1 = s;              // шаблонный конструктор
+  S cs1 = cs;            // copy constructor
+  S s2 = std::move(s);   // шаблонный конструктор
+  S cs2 = std::move(cs); // move constructor
+}
+```
+
+Почему так произошло?
+
+- `S s1 = s;` - дефолтный копирующий конструктор в себе имеет `const`, а
+  шаблонный - нет. Шаблонный не требует каста, поэтому выигрывает.
+- `S cs1 = cs;` - copy constructor из-за наличия const.
+- `S s2 = std::move(s);` - шаблонный, также из-за отсутствия `const` в
+  сигнатуре.
+- `S cs2 = std::move(cs);` - move constructor.
+
+Всё становится ещё хуже, если доопределить, например, свой copy constructor.
+Тогда не будет автоматически сгенерированных move constructor и assignment,
+из-за чего шаблонный конструктор сработает в 3/4 случаев.
+
+```cpp
+struct S {
+  S() = default;
+
+  S(S& other) = default;
+
+  template <typename T>
+  S(T&& value) {
+    std::cout << "template\n";
+  }
+};
+
+int main() {
+  S s;
+  const S cs;
+
+  S s1 = s;              // наш copy constructor
+  S cs1 = cs;            // шаблонный конструктор
+  S s2 = std::move(s);   // шаблонный конструктор
+  S cs2 = std::move(cs); // шаблонный конструктор
+}
+```
+
+## Аргументы по умолчанию
+
+Поехали.
+
+Вот это вообще не компилится, потому что нет вывода типа:
+
+```cpp
+struct S {
+  template <typename T>
+  void foo(T&& value = "Hello") {}
+};
+```
+
+А вот тут на, казалось бы, на вызов функций от одинаковых аргументов, вызовутся
+две разных функции:
+
+```cpp
+struct S {
+  template <typename T = const char*>
+  void foo(T&& value = "Hello") {}
+};
+
+int main() {
+  S s;
+  s.foo();        // T = const char*
+  s.foo("Hello"); // T = const char (&)[6]
+}
+```
+
+## Copy ellision
+
+### RVO - Return Value Optimization (стандартизовано с C++17)
+
+Рассмотрим следующий код:
+
+```cpp
+// Verbose выводит сообщение о вызове своиъ конструкторов и деструктора
+
+Verbose bar() {
+  return Verbose();
+}
+
+Verbose foo() {
+  return bar();
+}
+
+int main() {
+  Verbose v = foo();
+}
+```
+
+Казалось бы, в этом коде должны быть вызваны:
+
+1. Конструктор по умолчанию
+2. Copy constructor при выходе из `bar()`
+3. Copy constructor при выходе из `foo()`
+4. Copy constructor при записи в v;
+5. Деструктор
+
+По факту вызовутся только:
+
+1. Конструктор по умолчанию
+2. Деструктор
+
+Так происходит, когда в моменте вызова функции создаётся prvalue (об этом через
+неделю).
+
+### NRVO - Named Return Value Optimization
+
+```cpp
+Verbose bar() {
+  Verbose v; // изменение вот тут
+  return v;  // мы возвращаем локальный объект
+}
+
+Verbose foo() {
+  return bar();
+}
+
+int main() {
+  Verbose v = foo();
+}
+```
+
+В этой ситуации тоже будут вызваны только конструктор по умолчанию и деструктор.
+
+Усложним пример:
+
+```cpp
+Verbose bar(int x) {
+  Verbose v1;
+  Verbose v2;
+  if (x > 10) {
+    return v1;
+  } else {
+    return v2;
+  }
+}
+
+Verbose foo(int x) {
+  return bar(x);
+}
+
+int main() {
+  Verbose v = foo();
+}
+```
+
+Тут вызовутся:
+
+1. Два дефолтных конструктора на v1 и v2
+2. Move constructor из `bar()` в `foo()`
+3. Деструктор одного из объектов
+4. Деструктор второго объекта
+
+## Проблема в `std::vector`
+
+Казалось бы, при реаллокации вектора можно все элементы из предыдущего блока
+памяти мувнуть в новый.
+
+Представим, что на каком-то элементе у нас полетело исключение из move
+constructor. Тогда, чтобы вернуться в начальное состояние (строгая гарантия
+исключений), мы начнём мувать всё обратно. А если полетит ещё одно исключение,
+будет вызван `std::terminate`. Поздравляю, наш вектор убил программу.
+
+По этой причине была создана функция `std::move_if_noexcept()`. Она работает как
+`std::move` только если move constructor помечен как `noexcept`, а иначе
+возвращает обычную ссылку на объект.
+
+Итак, в векторе, если элемент имеет `noexcept` move constructor, будет
+использован он, а если нет, то вызывается copy constructor.
+
+Из этого также следует, что, если у объекта удалён copy constructor, а move
+constructor не помечен `noexcept`, вектор не скомпилируется.
+
+## Reference qualifier
+
+С C++11 появилась перегрузка методов по reference qualifier:
+
+```cpp
+struct S {
+  void foo() & {
+    std::cout << "lvalue\n";
+  }
+
+  void foo() && {
+    std::cout << "rvalue\n";
+  }
+};
+
+int main() {
+  S s;
+  s.foo();            // lvalue
+  S().foo();          // rvalue
+  std::move(s).foo(); // rvalue
+}
 ```
